@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,22 +14,23 @@ import (
 )
 
 type ServiceChange struct {
-	Operation string `json:"operation"`
-	Path      string `json:"path"`
-	Key       string `json:"address"`
-	Meta      string `json:"meta"`
+	Operation      string `json:"operation"`
+	ServicePath    string `json:"service_path"`
+	ServiceAddress string `json:"service_address"`
+	Meta           string `json:"meta"`
 }
 
 // PostgresDiscovery is a PostgreSQL-based service discovery.
 // It accepts an external connection pool and watches for service updates.
 type PostgresDiscovery struct {
-	servicePath string
-	table       string
-	pool        *pgxpool.Pool
-	pairsMu     sync.RWMutex
-	pairs       []*client.KVPair
-	chans       []chan []*client.KVPair
-	mu          sync.Mutex
+	servicePath    string
+	serviceAddress string
+	table          string
+	pool           *pgxpool.Pool
+	pairsMu        sync.RWMutex
+	pairs          []*client.KVPair
+	chans          []chan []*client.KVPair
+	mu             sync.Mutex
 
 	// -1 means it always retry to watch until postgres is ok, 0 means no retry.
 	RetriesAfterWatchFailed int
@@ -53,18 +53,19 @@ type PostgresDiscoveryOption struct {
 }
 
 // NewPostgresDiscoveryWithPool returns a new PostgresDiscovery using an existing pool.
-func NewPostgresDiscoveryWithPool(ctx context.Context, servicePath string, pool *pgxpool.Pool, opt *PostgresDiscoveryOption) (*PostgresDiscovery, error) {
+func NewPostgresDiscoveryWithPool(ctx context.Context, serviceAddress, servicePath string, pool *pgxpool.Pool, opt *PostgresDiscoveryOption) (*PostgresDiscovery, error) {
 	if pool == nil {
 		return nil, fmt.Errorf("pgxpool cannot be nil")
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
 	d := &PostgresDiscovery{
-		servicePath: servicePath,
-		pool:        pool,
-		ctx:         ctx,
-		cancel:      cancel,
-		stopCh:      make(chan struct{}),
+		serviceAddress: serviceAddress,
+		servicePath:    servicePath,
+		pool:           pool,
+		ctx:            ctx,
+		cancel:         cancel,
+		stopCh:         make(chan struct{}),
 	}
 
 	// Apply options
@@ -98,22 +99,17 @@ func (d *PostgresDiscovery) loadServices() error {
 
 	var pairs []*client.KVPair
 	for rows.Next() {
-		var key, value string
-		err := rows.Scan(&key, &value)
+		var address, meta string
+		err := rows.Scan(&address, &meta)
 		if err != nil {
 			return fmt.Errorf("error scanning row: %w", err)
 		}
 
-		// Extract the service key from the nodePath
-		parts := strings.Split(key, "/")
-		if len(parts) > 0 {
-			serviceKey := parts[len(parts)-1]
-			pair := &client.KVPair{Key: serviceKey, Value: value}
-			if d.filter != nil && !d.filter(pair) {
-				continue
-			}
-			pairs = append(pairs, pair)
+		pair := &client.KVPair{Key: address, Value: meta}
+		if d.filter != nil && !d.filter(pair) {
+			continue
 		}
+		pairs = append(pairs, pair)
 	}
 
 	if err = rows.Err(); err != nil {
@@ -138,7 +134,10 @@ func (d *PostgresDiscovery) watch() {
 			retry := d.RetriesAfterWatchFailed
 
 			for d.RetriesAfterWatchFailed < 0 || retry >= 0 {
-				err := d.watchChanges()
+				watchCtx, cancel := context.WithCancel(d.ctx)
+				err := d.watchChanges(watchCtx)
+				cancel()
+
 				if err != nil {
 					if d.RetriesAfterWatchFailed > 0 {
 						retry--
@@ -161,20 +160,20 @@ func (d *PostgresDiscovery) watch() {
 	}
 }
 
-func (d *PostgresDiscovery) watchChanges() error {
-	conn, err := d.pool.Acquire(d.ctx)
+func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
+	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire connection: %w", err)
 	}
 	defer conn.Release()
 
-	_, err = conn.Exec(d.ctx, fmt.Sprintf("LISTEN %s", serverplugin.ServiceChangeChannel))
+	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", serverplugin.ServiceChangeChannel))
 	if err != nil {
 		return fmt.Errorf("failed to start listening: %w", err)
 	}
 
 	for {
-		notification, err := conn.Conn().WaitForNotification(d.ctx)
+		notification, err := conn.Conn().WaitForNotification(ctx)
 		if err != nil {
 			return fmt.Errorf("error waiting for notification: %w", err)
 		}
@@ -186,8 +185,8 @@ func (d *PostgresDiscovery) watchChanges() error {
 			continue
 		}
 
-		// Only process changes for our base path
-		if change.Path != d.servicePath {
+		// Skip self-instance notifications
+		if change.ServiceAddress == d.serviceAddress {
 			continue
 		}
 
@@ -254,7 +253,7 @@ func (d *PostgresDiscovery) RemoveWatcher(ch chan []*client.KVPair) {
 
 // Clone clones this ServiceDiscovery with new servicePath
 func (d *PostgresDiscovery) Clone(servicePath string) (client.ServiceDiscovery, error) {
-	return NewPostgresDiscoveryWithPool(d.ctx, servicePath, d.pool, &PostgresDiscoveryOption{
+	return NewPostgresDiscoveryWithPool(context.Background(), d.serviceAddress, servicePath, d.pool, &PostgresDiscoveryOption{
 		RetryCount: d.RetriesAfterWatchFailed,
 		Filter:     d.filter,
 		Table:      d.table,

@@ -27,7 +27,7 @@ type PostgresRegisterPlugin struct {
 	// service path for rpcx server, for example com/example/rpcx/myservice
 	ServicePath string
 	// PostgreSQL table for service registry
-	Table string
+	table string
 	// Metrics for monitoring
 	Metrics metrics.Registry
 	// Registered services
@@ -61,7 +61,7 @@ func NewPostgresRegisterPlugin(ctx context.Context, pool *pgxpool.Pool, serviceA
 	return &PostgresRegisterPlugin{
 		ServiceAddress: serviceAddress,
 		ServicePath:    servicePath,
-		Table:          table,
+		table:          table,
 		UpdateInterval: updateInterval,
 		pool:           pool,
 		ctx:            ctx,
@@ -89,13 +89,13 @@ func (p *PostgresRegisterPlugin) Start() error {
 		BEGIN
 			PERFORM pg_notify('%s', 
 				json_build_object(
-					'operation', TG_OP,
-					'path', NEW.path,
-					'address', NEW.address,
-					'meta', NEW.meta
-				)::text
+           			'operation', TG_OP,
+            		'service_path', CASE WHEN TG_OP = 'DELETE' THEN OLD.path ELSE NEW.path END,
+            		'service_address', CASE WHEN TG_OP = 'DELETE' THEN OLD.address ELSE NEW.address END,
+            		'meta', CASE WHEN TG_OP = 'DELETE' THEN OLD.meta ELSE NEW.meta END
+        		)::text
 			);
-			RETURN NEW;
+			RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
 		END;
 		$$ LANGUAGE plpgsql;
 
@@ -103,7 +103,7 @@ func (p *PostgresRegisterPlugin) Start() error {
 		CREATE TRIGGER service_changes_trigger
 			AFTER INSERT OR UPDATE OR DELETE ON %s
 			FOR EACH ROW EXECUTE FUNCTION notify_service_change();
-	`, p.Table, ServiceChangeChannel, p.Table, p.Table))
+	`, p.table, ServiceChangeChannel, p.table, p.table))
 
 	if err != nil {
 		log.Errorf("cannot create postgres tables: %v", err)
@@ -117,6 +117,7 @@ func (p *PostgresRegisterPlugin) Start() error {
 	return nil
 }
 
+// updateMetrics updates service metrics
 func (p *PostgresRegisterPlugin) updateMetrics() {
 	ticker := time.NewTicker(p.UpdateInterval)
 	defer ticker.Stop()
@@ -160,7 +161,7 @@ func (p *PostgresRegisterPlugin) updateMetrics() {
 				_, err := tx.Exec(p.ctx,
 					fmt.Sprintf(`UPDATE %s 
 					SET meta = $1, updated_at = CURRENT_TIMESTAMP
-					WHERE path = $2 AND address = $3`, p.Table),
+					WHERE path = $2 AND address = $3`, p.table),
 					newMeta, p.ServicePath, p.ServiceAddress)
 
 				if err != nil {
@@ -175,6 +176,8 @@ func (p *PostgresRegisterPlugin) updateMetrics() {
 				log.Errorf("failed to commit transaction: %v", err)
 			}
 			conn.Release()
+
+			p.cleanupStaleServices()
 		}
 	}
 }
@@ -213,7 +216,6 @@ func (p *PostgresRegisterPlugin) PreCall(_ context.Context, _, _ string, args in
 
 // Register handles registering event.
 func (p *PostgresRegisterPlugin) Register(name string, rcvr interface{}, metadata string) (err error) {
-	fmt.Println("[REMOVE] Registering service", name)
 	if strings.TrimSpace(name) == "" {
 		return errors.New("register service `name` can't be empty")
 	}
@@ -222,7 +224,7 @@ func (p *PostgresRegisterPlugin) Register(name string, rcvr interface{}, metadat
 		fmt.Sprintf(`INSERT INTO %s (path, address, meta)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (path, address) 
-		DO UPDATE SET meta = $3, updated_at = CURRENT_TIMESTAMP`, p.Table),
+		DO UPDATE SET meta = $3, updated_at = CURRENT_TIMESTAMP`, p.table),
 		p.ServicePath, p.ServiceAddress, metadata)
 
 	if err != nil {
@@ -250,7 +252,7 @@ func (p *PostgresRegisterPlugin) Unregister(name string) error {
 	}
 
 	_, err := p.pool.Exec(p.ctx,
-		fmt.Sprintf("DELETE FROM %s WHERE path = $1 AND address = $2", p.Table),
+		fmt.Sprintf("DELETE FROM %s WHERE path = $1 AND address = $2", p.table),
 		p.ServicePath, p.ServiceAddress)
 
 	if err != nil {
@@ -272,4 +274,17 @@ func (p *PostgresRegisterPlugin) Unregister(name string) error {
 	p.metasLock.Unlock()
 
 	return nil
+}
+
+// cleanupStaleServices deletes services that haven't been updated for more than 2 update intervals
+func (p *PostgresRegisterPlugin) cleanupStaleServices() {
+	_, err := p.pool.Exec(p.ctx,
+		fmt.Sprintf(`DELETE FROM %s 
+		WHERE path = $1 AND updated_at < $2`, p.table),
+		p.ServicePath,
+		time.Now().Add(-p.UpdateInterval*2))
+
+	if err != nil {
+		log.Errorf("failed to cleanup stale services: %v", err)
+	}
 }

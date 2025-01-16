@@ -12,6 +12,7 @@ The plugin can be configured with the following options:
 ### Server Plugin
 ```go
 type PostgresRegisterPlugin struct {
+    Table          string        // Table name for service registration (Default: "rpcx_services")
     ServicePath    string        // Service registration path
     ServiceAddress string        // Service address (e.g., "tcp@localhost:8972")
     UpdateInterval time.Duration // Interval for updating service TTL
@@ -21,8 +22,9 @@ type PostgresRegisterPlugin struct {
 ### Client Discovery
 ```go
 type PostgresDiscoveryOption struct {
-    RetryCount int                           // Retry count for watch operations (-1 for infinite)
-    Filter    client.ServiceDiscoveryFilter  // Optional filter for services
+    Table      string                         // Table name for service discovery (Default: "rpcx_services")
+    RetryCount int                            // Retry count for watch operations (-1 for infinite)
+    Filter     client.ServiceDiscoveryFilter  // Optional filter for services
 }
 ```
 
@@ -70,6 +72,7 @@ func runServer(pool *pgxpool.Pool) error {
         pool,
         "tcp@localhost:8972",    // service address
         "examples/arith",        // service path
+        "rpcx_services",         // table name
         30*time.Second,          // update interval
     )
     if err != nil {
@@ -102,6 +105,7 @@ func runClient(pool *pgxpool.Pool) error {
         "tcp@localhost:8973",     // client address
         &pgregistry.PostgresDiscoveryOption{
             RetryCount: -1,       // infinite retries
+            "rpcx_services",      // table name
         },
     )
     if err != nil {

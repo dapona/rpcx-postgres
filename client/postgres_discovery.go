@@ -72,6 +72,9 @@ func NewPostgresDiscoveryWithPool(ctx context.Context, serviceAddress, servicePa
 	if opt != nil {
 		d.RetriesAfterWatchFailed = opt.RetryCount
 		d.filter = opt.Filter
+		if len(opt.Table) == 0 {
+			opt.Table = serverplugin.DefaultServiceTable
+		}
 		d.table = opt.Table
 	} else {
 		d.RetriesAfterWatchFailed = -1

@@ -1,5 +1,5 @@
 ## Features
-- PostgreSQL-based service discovery for rpcx
+- PostgreSQL-based service discovery for [rpcx](https://github.com/smallnest/rpcx/) by [@smallnest](https://github.com/smallnest/)
 - Real-time service updates using PostgreSQL NOTIFY/LISTEN
 - Automatic cleanup of stale services
 

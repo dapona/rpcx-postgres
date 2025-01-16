@@ -7,6 +7,7 @@
 - PostgreSQL 13 or higher
 
 ## Configuration
+The TABLE, FUNCTION and TRIGGER will be automatically created on start.
 The plugin can be configured with the following options:
 
 ### Server Plugin

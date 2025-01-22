@@ -115,7 +115,7 @@ func runClient(pool *pgxpool.Pool) error {
     defer discovery.Close()
 
     // Create rpcx client
-    xclient := client.NewXClient("Arith", client.Failtry, client.RandomSelect, discovery, client.DefaultOption)
+    xclient := client.NewXClient("Arith", client.Failtry, client.RoundRobin, discovery, client.DefaultOption)
     defer xclient.Close()
 
     // Call service

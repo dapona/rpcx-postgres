@@ -184,7 +184,11 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 		var change ServiceChange
 		err = json.Unmarshal([]byte(notification.Payload), &change)
 		if err != nil {
-			log.Errorf("failed to unmarshal notification: %v", err)
+			return fmt.Errorf("failed to unmarshal notification: %v", err)
+		}
+
+		// Skip if the change is not for this service
+		if change.ServicePath != d.servicePath {
 			continue
 		}
 
@@ -196,8 +200,7 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 		// Reload services and notify watchers
 		err = d.loadServices()
 		if err != nil {
-			log.Errorf("failed to reload services after change: %v", err)
-			continue
+			return fmt.Errorf("failed to reload services after change: %v", err)
 		}
 
 		d.pairsMu.RLock()

@@ -132,6 +132,7 @@ func runClient(pool *pgxpool.Pool) error {
 }
 
 func main() {
+    var postgresURL = flag.String("postgres-url", "postgres://localhost:5432/mydb", "PostgreSQL connection URL")
     flag.Parse()
 
     // Create PostgreSQL connection pool

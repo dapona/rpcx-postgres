@@ -130,8 +130,8 @@ github.com/rubyist/circuitbreaker v2.2.1+incompatible h1:KUKd/pV8Geg77+8LNDwdow6
 github.com/rubyist/circuitbreaker v2.2.1+incompatible/go.mod h1:Ycs3JgJADPuzJDwffe12k6BZT8hxVi6lFK+gWYJLN4A=
 github.com/smallnest/quick v0.2.0 h1:AEvm7ZovZ6Utv+asFDBh866G4ufMNhRNMKbZHVMFYPE=
 github.com/smallnest/quick v0.2.0/go.mod h1:ODNivpfZTaMgYrNb/fhDtqoEe2TTPxSRo8JaIT/QThI=
-github.com/smallnest/rpcx v1.8.36 h1:K4TlcZz/5a1SrdZrKf2EgjR7QSsXnOvBRnfrAbkcgw8=
-github.com/smallnest/rpcx v1.8.36/go.mod h1:2RJJq8bVFUsqiSRKGoP1mpWaYTgzPZx7JAoVVfR7HEo=
+github.com/smallnest/rpcx v1.8.37 h1:BLyc8fOxpKGUQl+nGnzsxJFc8wudknNrGSKM/VLNKbI=
+github.com/smallnest/rpcx v1.8.37/go.mod h1:EBfiDBErkYoz++WHW/idoyHkW+WUX60A/88fLL1lpbM=
 github.com/smallnest/rsocket v0.0.0-20241130025819-fb14bead82dd h1:/uoOiwJ9g2MRmyZGdv+Yxvp/JY75YGRtoyUI78P7Jb8=
 github.com/smallnest/rsocket v0.0.0-20241130025819-fb14bead82dd/go.mod h1:VJeIKKrDEzT4ZNVe87JN9uRLw1XLp/ZnnE9PfsyJ1jY=
 github.com/soheilhy/cmux v0.1.5 h1:jjzc5WVemNEDTLwv9tlmemhC73tI08BNOIGwBOo10Js=

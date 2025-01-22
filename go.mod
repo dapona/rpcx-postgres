@@ -5,7 +5,7 @@ go 1.23.4
 require (
 	github.com/jackc/pgx/v5 v5.7.2
 	github.com/rcrowley/go-metrics v0.0.0-20201227073835-cf1acfcdf475
-	github.com/smallnest/rpcx v1.8.36
+	github.com/smallnest/rpcx v1.8.37
 )
 
 require (

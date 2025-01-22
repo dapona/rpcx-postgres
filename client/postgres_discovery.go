@@ -124,6 +124,23 @@ func (d *PostgresDiscovery) loadServices() error {
 	d.pairs = pairs
 	d.pairsMu.Unlock()
 
+	d.mu.Lock()
+	for _, ch := range d.chans {
+		ch := ch
+		go func() {
+			defer func() {
+				recover()
+			}()
+
+			select {
+			case ch <- pairs:
+			case <-time.After(time.Minute):
+				rpcxlog.Warn("chan is full and new change has been dropped")
+			}
+		}()
+	}
+	d.mu.Unlock()
+
 	return nil
 }
 
@@ -212,32 +229,75 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 				continue
 			}
 
-			// Reload services and notify watchers
-			err = d.loadServices()
-			if err != nil {
-				return fmt.Errorf("failed to reload services after change: %v", err)
-			}
+			if change.Operation == "UPDATE" || change.Operation == "INSERT" {
+				// Create new KVPair from the change
+				pair := &client.KVPair{
+					Key:   change.ServiceAddress,
+					Value: change.Meta,
+				}
 
-			d.pairsMu.RLock()
-			pairs := d.pairs
-			d.pairsMu.RUnlock()
-
-			d.mu.Lock()
-			for _, ch := range d.chans {
-				ch := ch
-				go func() {
-					defer func() {
-						recover()
-					}()
-
-					select {
-					case ch <- pairs:
-					case <-time.After(time.Minute):
-						rpcxlog.Warn("chan is full and new change has been dropped")
+				d.pairsMu.Lock()
+				// Find and update existing pair or append new one
+				updated := false
+				for i, p := range d.pairs {
+					if p.Key == pair.Key {
+						d.pairs[i] = pair
+						updated = true
+						break
 					}
-				}()
+				}
+				if !updated {
+					d.pairs = append(d.pairs, pair)
+				}
+				d.pairsMu.Unlock()
+
+				// Notify watchers of the change
+				d.mu.Lock()
+				for _, ch := range d.chans {
+					ch := ch
+					go func() {
+						defer func() {
+							recover()
+						}()
+
+						select {
+						case ch <- d.pairs:
+						case <-time.After(time.Minute):
+							rpcxlog.Warn("chan is full and new change has been dropped")
+						}
+					}()
+				}
+				d.mu.Unlock()
+			} else if change.Operation == "DELETE" {
+				d.pairsMu.Lock()
+				// Remove the pair with matching address
+				filtered := d.pairs[:0]
+				for _, p := range d.pairs {
+					if p.Key != change.ServiceAddress {
+						filtered = append(filtered, p)
+					}
+				}
+				d.pairs = filtered
+				d.pairsMu.Unlock()
+
+				// Notify watchers of the change
+				d.mu.Lock()
+				for _, ch := range d.chans {
+					ch := ch
+					go func() {
+						defer func() {
+							recover()
+						}()
+
+						select {
+						case ch <- d.pairs:
+						case <-time.After(time.Minute):
+							rpcxlog.Warn("chan is full and new change has been dropped")
+						}
+					}()
+				}
+				d.mu.Unlock()
 			}
-			d.mu.Unlock()
 		}
 	}
 }

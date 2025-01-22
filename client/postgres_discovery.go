@@ -10,7 +10,7 @@ import (
 	"github.com/dapona/rpcx-postgres/serverplugin"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/smallnest/rpcx/client"
-	"github.com/smallnest/rpcx/log"
+	rpcxlog "github.com/smallnest/rpcx/log"
 )
 
 type ServiceChange struct {
@@ -37,9 +37,10 @@ type PostgresDiscovery struct {
 
 	filter client.ServiceDiscoveryFilter
 
-	stopCh chan struct{}
-	ctx    context.Context
-	cancel context.CancelFunc
+	stopCh    chan struct{}
+	ctx       context.Context
+	cancel    context.CancelFunc
+	watchConn *pgxpool.Conn // Track the watch connection
 }
 
 // PostgresDiscoveryOption represents options for PostgresDiscovery
@@ -130,7 +131,6 @@ func (d *PostgresDiscovery) watch() {
 	for {
 		select {
 		case <-d.stopCh:
-			log.Info("discovery has been closed")
 			return
 		default:
 			var tempDelay time.Duration
@@ -153,7 +153,7 @@ func (d *PostgresDiscovery) watch() {
 					if max := 30 * time.Second; tempDelay > max {
 						tempDelay = max
 					}
-					log.Warnf("watch error (with retry %d, sleep %v): %v", retry, tempDelay, err)
+					rpcxlog.Warnf("watch error (with retry %d, sleep %v): %v", retry, tempDelay, err)
 					time.Sleep(tempDelay)
 					continue
 				}
@@ -164,65 +164,81 @@ func (d *PostgresDiscovery) watch() {
 }
 
 func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
-	conn, err := d.pool.Acquire(ctx)
+	var err error
+	d.watchConn, err = d.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire connection: %w", err)
 	}
-	defer conn.Release()
+	defer func() {
+		if d.watchConn != nil {
+			d.watchConn.Release()
+			d.watchConn = nil
+		}
+	}()
 
-	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", serverplugin.ServiceChangeChannel))
+	_, err = d.watchConn.Exec(ctx, fmt.Sprintf("LISTEN %s", serverplugin.ServiceChangeChannel))
 	if err != nil {
 		return fmt.Errorf("failed to start listening: %w", err)
 	}
 
 	for {
-		notification, err := conn.Conn().WaitForNotification(ctx)
-		if err != nil {
-			return fmt.Errorf("error waiting for notification: %w", err)
-		}
-
-		var change ServiceChange
-		err = json.Unmarshal([]byte(notification.Payload), &change)
-		if err != nil {
-			return fmt.Errorf("failed to unmarshal notification: %v", err)
-		}
-
-		// Skip if the change is not for this service
-		if change.ServicePath != d.servicePath {
-			continue
-		}
-
-		// Skip self-instance notifications
-		if change.ServiceAddress == d.serviceAddress {
-			continue
-		}
-
-		// Reload services and notify watchers
-		err = d.loadServices()
-		if err != nil {
-			return fmt.Errorf("failed to reload services after change: %v", err)
-		}
-
-		d.pairsMu.RLock()
-		pairs := d.pairs
-		d.pairsMu.RUnlock()
-
-		d.mu.Lock()
-		for _, ch := range d.chans {
-			ch := ch
-			go func() {
-				defer func() {
-					recover()
-				}()
-
-				select {
-				case ch <- pairs:
-				case <-time.After(time.Minute):
-					log.Warn("chan is full and new change has been dropped")
+		select {
+		case <-d.stopCh:
+			return nil
+		case <-ctx.Done():
+			return nil
+		default:
+			notification, err := d.watchConn.Conn().WaitForNotification(ctx)
+			if err != nil {
+				if ctx.Err() != nil {
+					return nil
 				}
-			}()
+				return fmt.Errorf("error waiting for notification: %w", err)
+			}
+
+			var change ServiceChange
+			err = json.Unmarshal([]byte(notification.Payload), &change)
+			if err != nil {
+				return fmt.Errorf("failed to unmarshal notification: %v", err)
+			}
+
+			// Skip if the change is not for this service
+			if change.ServicePath != d.servicePath {
+				continue
+			}
+
+			// Skip self-instance notifications
+			if change.ServiceAddress == d.serviceAddress {
+				continue
+			}
+
+			// Reload services and notify watchers
+			err = d.loadServices()
+			if err != nil {
+				return fmt.Errorf("failed to reload services after change: %v", err)
+			}
+
+			d.pairsMu.RLock()
+			pairs := d.pairs
+			d.pairsMu.RUnlock()
+
+			d.mu.Lock()
+			for _, ch := range d.chans {
+				ch := ch
+				go func() {
+					defer func() {
+						recover()
+					}()
+
+					select {
+					case ch <- pairs:
+					case <-time.After(time.Minute):
+						rpcxlog.Warn("chan is full and new change has been dropped")
+					}
+				}()
+			}
+			d.mu.Unlock()
 		}
-		d.mu.Unlock()
 	}
 }
 
@@ -273,6 +289,18 @@ func (d *PostgresDiscovery) SetFilter(filter client.ServiceDiscoveryFilter) {
 
 // Close closes the discovery but not the underlying pool
 func (d *PostgresDiscovery) Close() {
+	// Signal to stop watching
 	close(d.stopCh)
-	d.cancel()
+	if d.cancel != nil {
+		d.cancel()
+	}
+
+	// Brief wait for watch to finish
+	time.Sleep(10 * time.Millisecond)
+
+	// Release connection after watch has stopped
+	if d.watchConn != nil {
+		d.watchConn.Release()
+		d.watchConn = nil
+	}
 }

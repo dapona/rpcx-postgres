@@ -364,3 +364,18 @@ func (d *PostgresDiscovery) Close() {
 		d.watchConn = nil
 	}
 }
+
+// RefreshCache manually reloads the services from the database.
+// This is useful when the NOTIFY mechanism fails to update the cache properly.
+func (d *PostgresDiscovery) RefreshCache() error {
+	rpcxlog.Infof("manually refreshing service cache for path: %s", d.servicePath)
+
+	// Use loadServices to update the cache
+	err := d.loadServices()
+	if err != nil {
+		return fmt.Errorf("failed to refresh service cache: %w", err)
+	}
+
+	rpcxlog.Infof("service cache refreshed successfully for path: %s", d.servicePath)
+	return nil
+}

@@ -99,7 +99,7 @@ func (p *PostgresRegisterPlugin) Start() error {
 		END;
 		$$ LANGUAGE plpgsql;
 
-		CREATE TRIGGER IF NOT EXISTS service_changes_trigger
+		CREATE OR REPLACE TRIGGER service_changes_trigger
 			AFTER INSERT OR UPDATE OR DELETE ON %s
 			FOR EACH ROW EXECUTE FUNCTION notify_service_change();
 	`, p.table, ServiceChangeChannel, p.table))

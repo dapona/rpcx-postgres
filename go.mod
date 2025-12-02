@@ -3,7 +3,7 @@ module github.com/dapona/rpcx-postgres
 go 1.25
 
 require (
-	github.com/jackc/pgx/v5 v5.7.5
+	github.com/jackc/pgx/v5 v5.7.6
 	github.com/rcrowley/go-metrics v0.0.0-20250401214520-65e299d6c5c9
 	github.com/smallnest/rpcx v1.9.1
 )

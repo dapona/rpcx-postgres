@@ -4,7 +4,7 @@
 - Automatic cleanup of stale services
 
 ## Requirements
-- PostgreSQL 13 or higher
+- PostgreSQL 14 or higher
 
 ## Configuration
 The TABLE, FUNCTION and TRIGGER will be automatically created on start.

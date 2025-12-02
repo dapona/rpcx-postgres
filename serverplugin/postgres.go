@@ -99,11 +99,10 @@ func (p *PostgresRegisterPlugin) Start() error {
 		END;
 		$$ LANGUAGE plpgsql;
 
-		DROP TRIGGER IF EXISTS service_changes_trigger ON %s;
-		CREATE TRIGGER service_changes_trigger
+		CREATE TRIGGER IF NOT EXISTS service_changes_trigger
 			AFTER INSERT OR UPDATE OR DELETE ON %s
 			FOR EACH ROW EXECUTE FUNCTION notify_service_change();
-	`, p.table, ServiceChangeChannel, p.table, p.table))
+	`, p.table, ServiceChangeChannel, p.table))
 
 	if err != nil {
 		log.Errorf("cannot create postgres tables: %v", err)

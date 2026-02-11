@@ -99,10 +99,12 @@ func (p *PostgresRegisterPlugin) Start() error {
 		END;
 		$$ LANGUAGE plpgsql;
 
+		CREATE INDEX IF NOT EXISTS idx_%s_path_updated_at ON %s(path, updated_at);
+
 		CREATE OR REPLACE TRIGGER service_changes_trigger
 			AFTER INSERT OR UPDATE OR DELETE ON %s
 			FOR EACH ROW EXECUTE FUNCTION notify_service_change();
-	`, p.table, ServiceChangeChannel, p.table))
+	`, p.table, ServiceChangeChannel, p.table, p.table, p.table))
 
 	if err != nil {
 		log.Errorf("cannot create postgres tables: %v", err)
@@ -146,7 +148,13 @@ func (p *PostgresRegisterPlugin) updateMetrics() {
 				continue
 			}
 
-			for _, name := range p.Services {
+			p.metasLock.RLock()
+			services := make([]string, len(p.Services))
+			copy(services, p.Services)
+			p.metasLock.RUnlock()
+
+			var txErr error
+			for _, name := range services {
 				p.metasLock.RLock()
 				meta := p.metas[name]
 				p.metasLock.RUnlock()
@@ -157,17 +165,22 @@ func (p *PostgresRegisterPlugin) updateMetrics() {
 				}
 				newMeta := v.Encode()
 
-				_, err := tx.Exec(p.ctx,
-					fmt.Sprintf(`UPDATE %s 
+				_, txErr = tx.Exec(p.ctx,
+					fmt.Sprintf(`UPDATE %s
 					SET meta = $1, updated_at = CURRENT_TIMESTAMP
 					WHERE path = $2 AND address = $3`, p.table),
 					newMeta, p.ServicePath, p.ServiceAddress)
 
-				if err != nil {
-					log.Errorf("failed to update service metrics: %v", err)
+				if txErr != nil {
+					log.Errorf("failed to update service metrics: %v", txErr)
 					tx.Rollback(p.ctx)
 					break
 				}
+			}
+
+			if txErr != nil {
+				conn.Release()
+				continue
 			}
 
 			err = tx.Commit(p.ctx)
@@ -184,7 +197,9 @@ func (p *PostgresRegisterPlugin) updateMetrics() {
 // Stop unregisters all services.
 func (p *PostgresRegisterPlugin) Stop() error {
 	close(p.dying)
-	<-p.done
+	if p.UpdateInterval > 0 {
+		<-p.done
+	}
 
 	// Unregister all services
 	for _, name := range p.Services {
@@ -206,7 +221,7 @@ func (p *PostgresRegisterPlugin) HandleConnAccept(conn net.Conn) (net.Conn, bool
 }
 
 // PreCall handles rpc call from clients
-func (p *PostgresRegisterPlugin) PreCall(_ context.Context, _, _ string, args interface{}) (interface{}, error) {
+func (p *PostgresRegisterPlugin) PreCall(_ context.Context, _, _ string, args any) (any, error) {
 	if p.Metrics != nil {
 		metrics.GetOrRegisterMeter("calls", p.Metrics).Mark(1)
 	}
@@ -214,7 +229,7 @@ func (p *PostgresRegisterPlugin) PreCall(_ context.Context, _, _ string, args in
 }
 
 // Register handles registering event.
-func (p *PostgresRegisterPlugin) Register(name string, rcvr interface{}, metadata string) (err error) {
+func (p *PostgresRegisterPlugin) Register(name string, rcvr any, metadata string) (err error) {
 	if strings.TrimSpace(name) == "" {
 		return errors.New("register service `name` can't be empty")
 	}
@@ -231,16 +246,15 @@ func (p *PostgresRegisterPlugin) Register(name string, rcvr interface{}, metadat
 		return fmt.Errorf("failed to register service: %w", err)
 	}
 
-	p.Services = append(p.Services, name)
-
 	p.metasLock.Lock()
+	p.Services = append(p.Services, name)
 	p.metas[name] = metadata
 	p.metasLock.Unlock()
 
 	return nil
 }
 
-func (p *PostgresRegisterPlugin) RegisterFunction(serviceName, fname string, fn interface{}, metadata string) error {
+func (p *PostgresRegisterPlugin) RegisterFunction(serviceName, fname string, fn any, metadata string) error {
 	return p.Register(serviceName, fn, metadata)
 }
 
@@ -260,6 +274,7 @@ func (p *PostgresRegisterPlugin) Unregister(name string) error {
 	}
 
 	// Remove from local services list
+	p.metasLock.Lock()
 	var services = make([]string, 0, len(p.Services)-1)
 	for _, s := range p.Services {
 		if s != name {
@@ -267,8 +282,6 @@ func (p *PostgresRegisterPlugin) Unregister(name string) error {
 		}
 	}
 	p.Services = services
-
-	p.metasLock.Lock()
 	delete(p.metas, name)
 	p.metasLock.Unlock()
 

@@ -38,9 +38,9 @@ type PostgresDiscovery struct {
 	filter client.ServiceDiscoveryFilter
 
 	stopCh    chan struct{}
+	watchDone chan struct{}
 	ctx       context.Context
 	cancel    context.CancelFunc
-	watchConn *pgxpool.Conn // Track the watch connection
 }
 
 // PostgresDiscoveryOption represents options for PostgresDiscovery
@@ -67,6 +67,7 @@ func NewPostgresDiscoveryWithPool(ctx context.Context, serviceAddress, servicePa
 		ctx:            ctx,
 		cancel:         cancel,
 		stopCh:         make(chan struct{}),
+		watchDone:      make(chan struct{}),
 	}
 
 	// Apply options
@@ -101,6 +102,10 @@ func (d *PostgresDiscovery) loadServices() error {
 	}
 	defer rows.Close()
 
+	d.pairsMu.RLock()
+	filter := d.filter
+	d.pairsMu.RUnlock()
+
 	var pairs []*client.KVPair
 	for rows.Next() {
 		var address, meta string
@@ -110,7 +115,7 @@ func (d *PostgresDiscovery) loadServices() error {
 		}
 
 		pair := &client.KVPair{Key: address, Value: meta}
-		if d.filter != nil && !d.filter(pair) {
+		if filter != nil && !filter(pair) {
 			continue
 		}
 		pairs = append(pairs, pair)
@@ -122,18 +127,19 @@ func (d *PostgresDiscovery) loadServices() error {
 
 	d.pairsMu.Lock()
 	d.pairs = pairs
+	snapshot := make([]*client.KVPair, len(d.pairs))
+	copy(snapshot, d.pairs)
 	d.pairsMu.Unlock()
 
 	d.mu.Lock()
 	for _, ch := range d.chans {
-		ch := ch
 		go func() {
 			defer func() {
 				recover()
 			}()
 
 			select {
-			case ch <- pairs:
+			case ch <- snapshot:
 			case <-time.After(time.Minute):
 				rpcxlog.Warn("chan is full and new change has been dropped")
 			}
@@ -145,6 +151,7 @@ func (d *PostgresDiscovery) loadServices() error {
 }
 
 func (d *PostgresDiscovery) watch() {
+	defer close(d.watchDone)
 	for {
 		select {
 		case <-d.stopCh:
@@ -171,7 +178,11 @@ func (d *PostgresDiscovery) watch() {
 						tempDelay = max
 					}
 					rpcxlog.Warnf("watch error (with retry %d, sleep %v): %v", retry, tempDelay, err)
-					time.Sleep(tempDelay)
+					select {
+					case <-time.After(tempDelay):
+					case <-d.stopCh:
+						return
+					}
 					continue
 				}
 				break
@@ -181,19 +192,13 @@ func (d *PostgresDiscovery) watch() {
 }
 
 func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
-	var err error
-	d.watchConn, err = d.pool.Acquire(ctx)
+	conn, err := d.pool.Acquire(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to acquire connection: %w", err)
 	}
-	defer func() {
-		if d.watchConn != nil {
-			d.watchConn.Release()
-			d.watchConn = nil
-		}
-	}()
+	defer conn.Release()
 
-	_, err = d.watchConn.Exec(ctx, fmt.Sprintf("LISTEN %s", serverplugin.ServiceChangeChannel))
+	_, err = conn.Exec(ctx, fmt.Sprintf("LISTEN %s", serverplugin.ServiceChangeChannel))
 	if err != nil {
 		return fmt.Errorf("failed to start listening: %w", err)
 	}
@@ -205,7 +210,7 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		default:
-			notification, err := d.watchConn.Conn().WaitForNotification(ctx)
+			notification, err := conn.Conn().WaitForNotification(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
 					return nil
@@ -249,19 +254,20 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 				if !updated {
 					d.pairs = append(d.pairs, pair)
 				}
+				snapshot := make([]*client.KVPair, len(d.pairs))
+				copy(snapshot, d.pairs)
 				d.pairsMu.Unlock()
 
 				// Notify watchers of the change
 				d.mu.Lock()
 				for _, ch := range d.chans {
-					ch := ch
 					go func() {
 						defer func() {
 							recover()
 						}()
 
 						select {
-						case ch <- d.pairs:
+						case ch <- snapshot:
 						case <-time.After(time.Minute):
 							rpcxlog.Warn("chan is full and new change has been dropped")
 						}
@@ -278,19 +284,20 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 					}
 				}
 				d.pairs = filtered
+				snapshot := make([]*client.KVPair, len(d.pairs))
+				copy(snapshot, d.pairs)
 				d.pairsMu.Unlock()
 
 				// Notify watchers of the change
 				d.mu.Lock()
 				for _, ch := range d.chans {
-					ch := ch
 					go func() {
 						defer func() {
 							recover()
 						}()
 
 						select {
-						case ch <- d.pairs:
+						case ch <- snapshot:
 						case <-time.After(time.Minute):
 							rpcxlog.Warn("chan is full and new change has been dropped")
 						}
@@ -306,7 +313,9 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 func (d *PostgresDiscovery) GetServices() []*client.KVPair {
 	d.pairsMu.RLock()
 	defer d.pairsMu.RUnlock()
-	return d.pairs
+	result := make([]*client.KVPair, len(d.pairs))
+	copy(result, d.pairs)
+	return result
 }
 
 // WatchService returns a channel to watch for changes
@@ -335,16 +344,22 @@ func (d *PostgresDiscovery) RemoveWatcher(ch chan []*client.KVPair) {
 
 // Clone clones this ServiceDiscovery with new servicePath
 func (d *PostgresDiscovery) Clone(servicePath string) (client.ServiceDiscovery, error) {
+	d.pairsMu.RLock()
+	filter := d.filter
+	d.pairsMu.RUnlock()
+
 	return NewPostgresDiscoveryWithPool(context.Background(), d.serviceAddress, servicePath, d.pool, &PostgresDiscoveryOption{
 		RetryCount: d.RetriesAfterWatchFailed,
-		Filter:     d.filter,
+		Filter:     filter,
 		Table:      d.table,
 	})
 }
 
 // SetFilter sets the filter
 func (d *PostgresDiscovery) SetFilter(filter client.ServiceDiscoveryFilter) {
+	d.pairsMu.Lock()
 	d.filter = filter
+	d.pairsMu.Unlock()
 }
 
 // Close closes the discovery but not the underlying pool
@@ -355,14 +370,16 @@ func (d *PostgresDiscovery) Close() {
 		d.cancel()
 	}
 
-	// Brief wait for watch to finish
-	time.Sleep(10 * time.Millisecond)
+	// Wait for watch goroutine to finish and release its connection
+	<-d.watchDone
 
-	// Release connection after watch has stopped
-	if d.watchConn != nil {
-		d.watchConn.Release()
-		d.watchConn = nil
+	// Close all watcher channels
+	d.mu.Lock()
+	for _, ch := range d.chans {
+		close(ch)
 	}
+	d.chans = nil
+	d.mu.Unlock()
 }
 
 // RefreshCache manually reloads the services from the database.

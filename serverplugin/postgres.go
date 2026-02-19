@@ -118,7 +118,7 @@ func (p *PostgresRegisterPlugin) Start() error {
 	return nil
 }
 
-// updateMetrics updates service metrics
+// updateMetrics updates service metrics and re-registers if needed (UPSERT).
 func (p *PostgresRegisterPlugin) updateMetrics() {
 	ticker := time.NewTicker(p.UpdateInterval)
 	defer ticker.Stop()
@@ -165,14 +165,18 @@ func (p *PostgresRegisterPlugin) updateMetrics() {
 				}
 				newMeta := v.Encode()
 
+				// UPSERT: re-registers the service if it was removed (e.g. by
+				// cleanupStaleServices during a DB failover). This makes the
+				// system self-healing — the next heartbeat restores the row.
 				_, txErr = tx.Exec(p.ctx,
-					fmt.Sprintf(`UPDATE %s
-					SET meta = $1, updated_at = CURRENT_TIMESTAMP
-					WHERE path = $2 AND address = $3`, p.table),
-					newMeta, p.ServicePath, p.ServiceAddress)
+					fmt.Sprintf(`INSERT INTO %s (path, address, meta)
+					VALUES ($1, $2, $3)
+					ON CONFLICT (path, address)
+					DO UPDATE SET meta = $3, updated_at = CURRENT_TIMESTAMP`, p.table),
+					p.ServicePath, p.ServiceAddress, newMeta)
 
 				if txErr != nil {
-					log.Errorf("failed to update service metrics: %v", txErr)
+					log.Errorf("failed to upsert service metrics: %v", txErr)
 					tx.Rollback(p.ctx)
 					break
 				}
@@ -288,12 +292,14 @@ func (p *PostgresRegisterPlugin) Unregister(name string) error {
 	return nil
 }
 
-// cleanupStaleServices deletes services that haven't been updated for more than 2 update intervals
+// cleanupStaleServices deletes services that haven't been updated for more
+// than 2 update intervals. Never deletes own registration (address != $2).
 func (p *PostgresRegisterPlugin) cleanupStaleServices() {
 	_, err := p.pool.Exec(p.ctx,
-		fmt.Sprintf(`DELETE FROM %s 
-		WHERE path = $1 AND updated_at < $2`, p.table),
+		fmt.Sprintf(`DELETE FROM %s
+		WHERE path = $1 AND address != $2 AND updated_at < $3`, p.table),
 		p.ServicePath,
+		p.ServiceAddress,
 		time.Now().Add(-p.UpdateInterval*2))
 
 	if err != nil {

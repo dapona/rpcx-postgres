@@ -32,9 +32,6 @@ type PostgresDiscovery struct {
 	chans          []chan []*client.KVPair
 	mu             sync.Mutex
 
-	// -1 means it always retry to watch until postgres is ok, 0 means no retry.
-	RetriesAfterWatchFailed int
-
 	filter client.ServiceDiscoveryFilter
 
 	stopCh    chan struct{}
@@ -45,8 +42,6 @@ type PostgresDiscovery struct {
 
 // PostgresDiscoveryOption represents options for PostgresDiscovery
 type PostgresDiscoveryOption struct {
-	// RetryCount for watch failures. -1 means infinite retries
-	RetryCount int
 	// Filter for filtering services
 	Filter client.ServiceDiscoveryFilter
 	// Table for storing services
@@ -72,14 +67,12 @@ func NewPostgresDiscoveryWithPool(ctx context.Context, serviceAddress, servicePa
 
 	// Apply options
 	if opt != nil {
-		d.RetriesAfterWatchFailed = opt.RetryCount
 		d.filter = opt.Filter
 		if len(opt.Table) == 0 {
 			opt.Table = serverplugin.DefaultServiceTable
 		}
 		d.table = opt.Table
 	} else {
-		d.RetriesAfterWatchFailed = -1
 		d.table = serverplugin.DefaultServiceTable
 	}
 
@@ -150,43 +143,51 @@ func (d *PostgresDiscovery) loadServices() error {
 	return nil
 }
 
+// watch retries indefinitely to maintain a LISTEN connection for service changes.
 func (d *PostgresDiscovery) watch() {
 	defer close(d.watchDone)
+
+	var tempDelay time.Duration
 	for {
 		select {
 		case <-d.stopCh:
 			return
 		default:
-			var tempDelay time.Duration
-			retry := d.RetriesAfterWatchFailed
+		}
 
-			for d.RetriesAfterWatchFailed < 0 || retry >= 0 {
-				watchCtx, cancel := context.WithCancel(d.ctx)
-				err := d.watchChanges(watchCtx)
-				cancel()
+		start := time.Now()
+		watchCtx, cancel := context.WithCancel(d.ctx)
+		err := d.watchChanges(watchCtx)
+		cancel()
 
-				if err != nil {
-					if d.RetriesAfterWatchFailed > 0 {
-						retry--
-					}
-					if tempDelay == 0 {
-						tempDelay = time.Second
-					} else {
-						tempDelay *= 2
-					}
-					if max := 30 * time.Second; tempDelay > max {
-						tempDelay = max
-					}
-					rpcxlog.Warnf("watch error (with retry %d, sleep %v): %v", retry, tempDelay, err)
-					select {
-					case <-time.After(tempDelay):
-					case <-d.stopCh:
-						return
-					}
-					continue
-				}
-				break
-			}
+		if err == nil {
+			continue
+		}
+
+		// Reset backoff if the connection was healthy for a while before failing.
+		if time.Since(start) > 30*time.Second {
+			tempDelay = 0
+		}
+
+		if tempDelay == 0 {
+			tempDelay = time.Second
+		} else {
+			tempDelay *= 2
+		}
+		if max := 30 * time.Second; tempDelay > max {
+			tempDelay = max
+		}
+		rpcxlog.Warnf("watch error (sleep %v): %v", tempDelay, err)
+		select {
+		case <-time.After(tempDelay):
+		case <-d.stopCh:
+			return
+		}
+
+		// Reload services after reconnecting — we may have missed
+		// NOTIFY events during the outage (e.g. DB failover).
+		if loadErr := d.loadServices(); loadErr != nil {
+			rpcxlog.Warnf("failed to reload services during watch recovery: %v", loadErr)
 		}
 	}
 }
@@ -349,9 +350,8 @@ func (d *PostgresDiscovery) Clone(servicePath string) (client.ServiceDiscovery, 
 	d.pairsMu.RUnlock()
 
 	return NewPostgresDiscoveryWithPool(context.Background(), d.serviceAddress, servicePath, d.pool, &PostgresDiscoveryOption{
-		RetryCount: d.RetriesAfterWatchFailed,
-		Filter:     filter,
-		Table:      d.table,
+		Filter: filter,
+		Table:  d.table,
 	})
 }
 

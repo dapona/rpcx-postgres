@@ -230,11 +230,6 @@ func (d *PostgresDiscovery) watchChanges(ctx context.Context) error {
 				continue
 			}
 
-			// Skip self-instance notifications
-			if change.ServiceAddress == d.serviceAddress {
-				continue
-			}
-
 			if change.Operation == "UPDATE" || change.Operation == "INSERT" {
 				// Create new KVPair from the change
 				pair := &client.KVPair{
